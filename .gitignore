@@ -1,0 +1,19 @@
+# Website
+/website/backend/node_modules/
+/website/frontend/node_modules/
+/website/frontend/.next/
+/website/frontend/out/
+/website/frontend/.env.local
+
+# OS
+.DS_Store
+
+# Data
+regulator_data.csv
+/website/backend/.env
+nul
+/main_master/build
+/env
+data_clear.py   
+substation_cleaned.csv
+single uart 3 pzem.ino
