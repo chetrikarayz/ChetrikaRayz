@@ -1,273 +1,789 @@
-#pragma once
-
-#include "../include/data_types.h"
-#include "../include/firmware.h"
-#include "../include/device_id.h"
-#include "../include/i2c_master.h"
-#include "../include/lcd_display.h"
-#include "../include/simcom_gsm.h"
 #include <ArduinoJson.h>
+#include <PZEM004Tv30.h>
+
+#define FW_VERSION     "2.0.0"
+
+#include "../include/simcom_gsm.h"
 #include "../include/ota.h"
 
-// Global variable definitions
+#include <Preferences.h>
+Preferences prefs;
+
+void savePhase(const String& phase)
+{
+    prefs.begin("swapper", false);
+    prefs.putString("lastPhase", phase);
+    prefs.end();
+}
+
+String loadPhase()
+{
+    prefs.begin("swapper", true);
+    String phase = prefs.getString("lastPhase", "NONE");
+    prefs.end();
+    return phase;
+}
+
+// ======================================================
+// GLOBAL VARIABLE DEFINITIONS
+// ======================================================
+
 String deviceID;
+
 HardwareSerial SerialGSM(1);
 bool gsmReady = false;
 unsigned long lastGSMRetry = 0;
-
-PZEMData slavePZEM1;
-PZEMData slavePZEM2;
-PZEMData slavePZEM3;
-PZEMData slavePZEM4;
-
-LiquidCrystal_I2C lcd(0x27, 20, 4);
-
-unsigned long lastI2CRead = 0;
-unsigned long lastSend = 0;
-unsigned long lastCommandPoll = 0;
-unsigned long lastHeartbeat = 0;
-
-const unsigned long SEND_INTERVAL_MS = 0;
-const unsigned long COMMAND_INTERVAL_MS = 10000;
-const unsigned long GSM_RETRY_INTERVAL_MS = 30000;
-const unsigned long I2C_READ_INTERVAL_MS = 0;
-const unsigned long HEARTBEAT_INTERVAL_MS = 60000;
 
 // OTA state
 bool otaInProgress = false;
 String otaStatus;
 
-// Energy reset offsets (subtracted from raw PZEM readings)
-float energyOffset1 = 0;
-float energyOffset2 = 0;
-float energyOffset3 = 0;
+// ======================================================
+// HARDWARE PINS
+// ======================================================
 
-// ==================== Heartbeat ====================
+#define RELAY_R 16
+#define RELAY_Y 17
+#define RELAY_B 18
+
+#define FB_R 36
+#define FB_Y 39
+#define FB_B 34
+
+#define PZEM_RX 33
+#define PZEM_TX 32
+
+#define LED_PIN 2
+
+// ======================================================
+// RELAY MODE
+// ======================================================
+
+bool RELAY_ACTIVE_LOW = true;
+
+uint8_t relayON()
+{
+    return RELAY_ACTIVE_LOW ? LOW : HIGH;
+}
+
+uint8_t relayOFF()
+{
+    return RELAY_ACTIVE_LOW ? HIGH : LOW;
+}
+
+// ======================================================
+// FEEDBACK TYPE CONFIGURATION
+// ======================================================
+
+bool FEEDBACK_ACTIVE_HIGH = false;
+
+bool feedbackON(uint8_t pin)
+{
+    return FEEDBACK_ACTIVE_HIGH ?
+           digitalRead(pin) :
+           !digitalRead(pin);
+}
+
+// ======================================================
+// TIMERS
+// ======================================================
+
+constexpr uint32_t PZEM_INTERVAL_MS      = 1000;
+constexpr uint32_t TELEMETRY_INTERVAL_MS = 1000;
+constexpr uint32_t COMMAND_INTERVAL_MS   = 3000;
+constexpr uint32_t HEARTBEAT_INTERVAL_MS = 60000;
+constexpr uint32_t GSM_RETRY_INTERVAL_MS = 10000;
+
+uint32_t switchDelayMs                    = 10000;
+constexpr uint32_t CONTACTOR_SETTLE_MS   = 1000;
+
+// ======================================================
+// PZEM
+// ======================================================
+
+HardwareSerial PZEMSerial(2);
+PZEM004Tv30 pzem(PZEMSerial, PZEM_RX, PZEM_TX);
+
+struct PzemData
+{
+    float voltage = 0;
+    float current = 0;
+    float power = 0;
+    float energy = 0;
+    float frequency = 0;
+    float pf = 0;
+};
+
+PzemData house;
+
+float energyOffset = 0;
+
+// ======================================================
+// SYSTEM STATE
+// ======================================================
+
+String currentPhase = "NONE";
+
+bool faultActive = false;
+bool lastFaultState = false;
+
+unsigned long lastPzemRead = 0;
+unsigned long lastTelemetry = 0;
+unsigned long lastCommandPoll = 0;
+unsigned long lastHeartbeat = 0;
+
+// ======================================================
+// FEEDBACK HELPERS
+// ======================================================
+
+uint8_t getFeedbackCount()
+{
+    return feedbackON(FB_R) +
+           feedbackON(FB_Y) +
+           feedbackON(FB_B);
+}
+
+void printFeedbackStatus()
+{
+    Serial.println("\n===== FEEDBACK =====");
+
+    Serial.print("R : ");
+    Serial.println(feedbackON(FB_R) ? "ON" : "OFF");
+
+    Serial.print("Y : ");
+    Serial.println(feedbackON(FB_Y) ? "ON" : "OFF");
+
+    Serial.print("B : ");
+    Serial.println(feedbackON(FB_B) ? "ON" : "OFF");
+
+    Serial.println("====================");
+}
+
+// ======================================================
+// RELAY CONTROL
+// ======================================================
+
+void allOff()
+{
+    digitalWrite(RELAY_R, relayOFF());
+    digitalWrite(RELAY_Y, relayOFF());
+    digitalWrite(RELAY_B, relayOFF());
+
+    currentPhase = "NONE";
+    savePhase(currentPhase);
+}
+
+void setRelay(String phase)
+{
+    allOff();
+
+    if (phase == "R")
+        digitalWrite(RELAY_R, relayON());
+    else if (phase == "Y")
+        digitalWrite(RELAY_Y, relayON());
+    else if (phase == "B")
+        digitalWrite(RELAY_B, relayON());
+}
+
+// ======================================================
+// SAFETY SYSTEM
+// ======================================================
+
+void raiseFault(String reason)
+{
+    if (faultActive) return;
+    faultActive = true;
+
+    Serial.println();
+    Serial.println("================================");
+    Serial.println("FAULT DETECTED");
+    Serial.println(reason);
+    Serial.println("================================");
+
+    allOff();
+}
+
+void clearFault()
+{
+    faultActive = false;
+    safetyCheck();
+
+    if (!faultActive)
+        Serial.println("FAULT CLEARED");
+    else
+        Serial.println("FAULT STILL PRESENT");
+
+    sendTelemetry();
+}
+
+void safetyCheck()
+{
+    if (currentPhase == "NONE")
+    {
+        if (getFeedbackCount() > 0)
+            raiseFault("CONTACTOR STUCK ON - ALL SHOULD BE OFF");
+    }
+    else if (currentPhase == "R")
+    {
+        if (!feedbackON(FB_R))
+            raiseFault("R PHASE FEEDBACK MISSING");
+        if (feedbackON(FB_Y))
+            raiseFault("Y FEEDBACK SHOULD BE OFF");
+        if (feedbackON(FB_B))
+            raiseFault("B FEEDBACK SHOULD BE OFF");
+    }
+    else if (currentPhase == "Y")
+    {
+        if (feedbackON(FB_R))
+            raiseFault("R FEEDBACK SHOULD BE OFF");
+        if (!feedbackON(FB_Y))
+            raiseFault("Y PHASE FEEDBACK MISSING");
+        if (feedbackON(FB_B))
+            raiseFault("B FEEDBACK SHOULD BE OFF");
+    }
+    else if (currentPhase == "B")
+    {
+        if (feedbackON(FB_R))
+            raiseFault("R FEEDBACK SHOULD BE OFF");
+        if (feedbackON(FB_Y))
+            raiseFault("Y FEEDBACK SHOULD BE OFF");
+        if (!feedbackON(FB_B))
+            raiseFault("B PHASE FEEDBACK MISSING");
+    }
+}
+
+// ======================================================
+// PHASE SWITCHING
+// ======================================================
+
+bool switchPhase(String phase)
+{
+    if (faultActive)
+    {
+        Serial.println("FAULT LOCKOUT ACTIVE");
+        return false;
+    }
+
+    if (phase == currentPhase)
+    {
+        Serial.println("Already on requested phase");
+        return true;
+    }
+
+    Serial.println("\nOpening all contactors");
+    allOff();
+    delay(switchDelayMs);
+
+    if (getFeedbackCount() > 0)
+    {
+        raiseFault("CONTACTOR STUCK AFTER OFF COMMAND");
+        return false;
+    }
+
+    setRelay(phase);
+    delay(CONTACTOR_SETTLE_MS);
+
+    if (getFeedbackCount() != 1)
+    {
+        raiseFault("INTERLOCK FAILURE");
+        return false;
+    }
+
+    if (phase == "R" && !feedbackON(FB_R))
+    {
+        raiseFault("R FEEDBACK MISSING");
+        return false;
+    }
+    if (phase == "Y" && !feedbackON(FB_Y))
+    {
+        raiseFault("Y FEEDBACK MISSING");
+        return false;
+    }
+    if (phase == "B" && !feedbackON(FB_B))
+    {
+        raiseFault("B FEEDBACK MISSING");
+        return false;
+    }
+
+    currentPhase = phase;
+    savePhase(currentPhase);
+
+    Serial.print("PHASE CHANGED TO : ");
+    Serial.println(currentPhase);
+    printFeedbackStatus();
+
+    sendTelemetry();
+
+    return true;
+}
+
+// ======================================================
+// TELEMETRY
+// ======================================================
+
+void sendTelemetry()
+{
+    if (!gsmReady) return;
+
+    JsonDocument doc;
+
+    doc["device_id"] = deviceID;
+    doc["fw_version"] = FW_VERSION;
+    doc["current_phase"] = currentPhase;
+    doc["fault"] = faultActive;
+    doc["voltage"] = house.voltage;
+    doc["current"] = house.current;
+    doc["power"] = house.power;
+    doc["energy"] = max(0.0f, house.energy - energyOffset);
+    doc["frequency"] = house.frequency;
+    doc["pf"] = house.pf;
+    doc["fb_r"] = feedbackON(FB_R);
+    doc["fb_y"] = feedbackON(FB_Y);
+    doc["fb_b"] = feedbackON(FB_B);
+
+    String payload;
+    serializeJson(doc, payload);
+
+    if (httpPost(API_DATA_PATH, payload, nullptr))
+    {
+        Serial.println("Telemetry Sent");
+    }
+    else
+    {
+        Serial.println("Telemetry Failed");
+        gsmReady = false;
+        lastGSMRetry = millis();
+    }
+}
+
+// ======================================================
+// HEARTBEAT
+// ======================================================
 
 void sendHeartbeat()
 {
-  if (!gsmReady) return;
+    if (!gsmReady) return;
 
-  JsonDocument doc;
+    JsonDocument doc;
 
-  doc["device_id"] = deviceID;
-  doc["fw_version"] = FW_VERSION;
-  doc["wifi_status"] = gsmReady ? "connected" : "disconnected";
-  doc["free_heap"] = ESP.getFreeHeap();
-  doc["uptime"] = millis() / 1000;
+    doc["device_id"] = deviceID;
+    doc["fw_version"] = FW_VERSION;
+    doc["phase"] = currentPhase;
+    doc["gsm"] = "connected";
+    doc["heap"] = ESP.getFreeHeap();
+    doc["uptime"] = millis() / 1000;
 
-  String payload;
-  serializeJson(doc, payload);
+    String payload;
+    serializeJson(doc, payload);
 
-  if (httpPost("/api/heartbeat?api_key=" DEVICE_API_KEY, payload, nullptr))
-  {
-    Serial.println("[MAIN] Heartbeat Sent");
-  }
-  else
-  {
-    Serial.println("[MAIN] Heartbeat Failed");
-    gsmReady = false;
-    lastGSMRetry = millis();
-  }
+    if (httpPost("/api/heartbeat?api_key=" DEVICE_API_KEY, payload, nullptr))
+    {
+        Serial.println("Heartbeat Sent");
+    }
+    else
+    {
+        Serial.println("Heartbeat Failed");
+        gsmReady = false;
+        lastGSMRetry = millis();
+    }
 }
 
-// ==================== Command Polling ====================
+// ======================================================
+// COMMAND POLLING
+// ======================================================
 
 void pollCommands()
 {
-  if (!gsmReady) return;
+    if (!gsmReady) return;
 
-  String endpoint = String(API_COMMANDS_PATH) + "/" + deviceID
-    + "?device_id=" + deviceID
-    + "&api_key=" DEVICE_API_KEY;
+    String endpoint = String(API_COMMANDS_PATH) + "/" + deviceID
+        + "?device_id=" + deviceID
+        + "&api_key=" DEVICE_API_KEY;
 
-  String response;
-  if (!httpGet(endpoint, &response))
-  {
-    gsmReady = false;
-    lastGSMRetry = millis();
-    return;
-  }
-
-  JsonDocument doc;
-  if (deserializeJson(doc, response))
-  {
-    Serial.println("[CMD] JSON parse failed");
-    return;
-  }
-
-  if (doc["command"].isNull())
-    return;
-
-  const char* cmdType = doc["command"]["type"];
-  if (!cmdType)
-    return;
-
-  Serial.print("[CMD] Received: ");
-  Serial.println(cmdType);
-
-  if (strcmp(cmdType, "restart") == 0)
-  {
-    Serial.println("[CMD] Restarting...");
-    delay(500);
-    ESP.restart();
-  }
-  else if (strcmp(cmdType, "ota") == 0)
-  {
-    const char* fwUrl = doc["command"]["params"]["firmware_url"];
-    const char* version = doc["command"]["params"]["version"];
-    size_t size = (size_t)doc["command"]["params"]["size"];
-
-    if (fwUrl && version && size > 0)
+    String response;
+    if (!httpGet(endpoint, &response))
     {
-      Serial.printf("[CMD] OTA: %s v%s (%u bytes)\n", fwUrl, version, (unsigned)size);
-      performOTA(String(fwUrl), String(version), size);
+        gsmReady = false;
+        lastGSMRetry = millis();
+        return;
     }
-    else
+
+    JsonDocument doc;
+
+    if (deserializeJson(doc, response))
     {
-      Serial.println("[CMD] OTA params incomplete — ignored. Use firmware manager to push a firmware version first.");
+        Serial.println("JSON Parse Failed");
+        return;
     }
-  }
-  else if (strcmp(cmdType, "reset_energy") == 0)
-  {
-    Serial.println("[CMD] Resetting energy counters");
-    energyOffset1 = slavePZEM1.energy;
-    energyOffset2 = slavePZEM2.energy;
-    energyOffset3 = slavePZEM3.energy;
-  }
+
+    if (doc["command"].isNull())
+        return;
+
+    const char* cmdType = doc["command"]["type"];
+
+    if (!cmdType)
+        return;
+
+    Serial.print("Command Type: ");
+    Serial.println(cmdType);
+
+    if (strcmp(cmdType, "swap_phase") == 0)
+    {
+        const char* phase = doc["command"]["params"]["phase"];
+        if (!phase) return;
+
+        if (strcmp(phase, "R") == 0)      switchPhase("R");
+        else if (strcmp(phase, "Y") == 0) switchPhase("Y");
+        else if (strcmp(phase, "B") == 0) switchPhase("B");
+        else if (strcmp(phase, "NONE") == 0)
+        {
+            allOff();
+            delay(CONTACTOR_SETTLE_MS);
+            if (getFeedbackCount() > 0)
+                raiseFault("CONTACTOR STUCK AFTER NONE COMMAND");
+            sendTelemetry();
+        }
+    }
+    else if (strcmp(cmdType, "restart") == 0)
+    {
+        Serial.println("Server Restart Command");
+        delay(1000);
+        ESP.restart();
+    }
+    else if (strcmp(cmdType, "clear_fault") == 0)
+    {
+        Serial.println("Clear Fault Command");
+        clearFault();
+    }
+    else if (strcmp(cmdType, "set_switch_delay") == 0)
+    {
+        uint32_t newDelay = (uint32_t)doc["command"]["params"]["delay_ms"];
+        if (newDelay >= 500 && newDelay <= 30000)
+        {
+            switchDelayMs = newDelay;
+            Serial.print("Switch delay updated to: ");
+            Serial.print(switchDelayMs);
+            Serial.println(" ms");
+        }
+        else
+        {
+            Serial.println("Invalid switch delay (must be 500-30000ms)");
+        }
+    }
+    else if (strcmp(cmdType, "ota") == 0)
+    {
+        const char* fwUrl = doc["command"]["params"]["firmware_url"];
+        const char* version = doc["command"]["params"]["version"];
+        size_t size = (size_t)doc["command"]["params"]["size"];
+
+        if (fwUrl && version && size > 0)
+        {
+            Serial.printf("[CMD] OTA: %s v%s (%u bytes)\n", fwUrl, version, (unsigned)size);
+            performOTA(String(fwUrl), String(version), size);
+        }
+        else
+        {
+            Serial.println("[CMD] OTA params incomplete — ignored. Use firmware manager to push a firmware version first.");
+        }
+    }
+    else if (strcmp(cmdType, "reset_energy") == 0)
+    {
+        Serial.println("[CMD] Resetting energy counter");
+        energyOffset = house.energy;
+    }
 }
+
+// ======================================================
+// PZEM READING
+// ======================================================
+
+void readPZEM()
+{
+    house.voltage = pzem.voltage();
+
+    if (isnan(house.voltage) || house.voltage < 50)
+    {
+        memset(&house, 0, sizeof(house));
+        return;
+    }
+
+    house.current   = pzem.current();
+    house.power     = pzem.power();
+    house.energy    = pzem.energy();
+    house.frequency = pzem.frequency();
+    house.pf        = pzem.pf();
+
+    if (isnan(house.current))   house.current = 0;
+    if (isnan(house.power))     house.power = 0;
+    if (isnan(house.energy))    house.energy = 0;
+    if (isnan(house.frequency)) house.frequency = 0;
+    if (isnan(house.pf))        house.pf = 0;
+    Serial.print("PZEM read at ");
+    Serial.println(millis());
+}
+
+// ======================================================
+// STATUS
+// ======================================================
+
+void printStatus()
+{
+    Serial.println();
+    Serial.println("========== DPS STATUS ==========");
+
+    Serial.print("Device ID : ");
+    Serial.println(deviceID);
+
+    Serial.print("Phase     : ");
+    Serial.println(currentPhase);
+
+    Serial.print("Fault     : ");
+    Serial.println(faultActive ? "YES" : "NO");
+
+    Serial.print("GSM       : ");
+    Serial.println(gsmReady ? "CONNECTED" : "DISCONNECTED");
+
+    Serial.println();
+
+    Serial.printf("Voltage   : %.1f V\n", house.voltage);
+    Serial.printf("Current   : %.3f A\n", house.current);
+    Serial.printf("Power     : %.1f W\n", house.power);
+    Serial.printf("Energy    : %.3f kWh\n", house.energy);
+    Serial.printf("Freq      : %.1f Hz\n", house.frequency);
+    Serial.printf("PF        : %.2f\n", house.pf);
+
+    Serial.println();
+
+    printFeedbackStatus();
+}
+
+// ======================================================
+// SERIAL COMMANDS
+// ======================================================
+
+void handleSerial()
+{
+    if (!Serial.available())
+        return;
+
+    char cmd = toupper(Serial.read());
+
+    while (Serial.available())
+        Serial.read();
+
+    switch (cmd)
+    {
+    case 'R':
+        switchPhase("R");
+        break;
+    case 'Y':
+        switchPhase("Y");
+        break;
+    case 'B':
+        switchPhase("B");
+        break;
+    case 'N':
+        allOff();
+        delay(CONTACTOR_SETTLE_MS);
+        if (getFeedbackCount() > 0)
+            raiseFault("CONTACTOR STUCK AFTER OFF COMMAND");
+        Serial.println("ALL CONTACTORS OFF");
+        sendTelemetry();
+        break;
+    case 'X':
+        clearFault();
+        break;
+    case 'S':
+        printStatus();
+        break;
+    case 'F':
+        printFeedbackStatus();
+        break;
+    case 'H':
+        Serial.println();
+        Serial.println("===== COMMANDS =====");
+        Serial.println("R = Switch R");
+        Serial.println("Y = Switch Y");
+        Serial.println("B = Switch B");
+        Serial.println("N = All OFF");
+        Serial.println("S = Full Status");
+        Serial.println("F = Feedback");
+        Serial.println("X = Reset Fault");
+        Serial.println("====================");
+        break;
+    }
+}
+
+// ======================================================
+// BOOT CONFIG FETCH
+// ======================================================
+
+void fetchDeviceConfig()
+{
+    if (!gsmReady) return;
+
+    String endpoint = String("/api/device/phase?device_id=") + deviceID
+        + "&api_key=" DEVICE_API_KEY;
+
+    String response;
+    if (!httpGet(endpoint, &response))
+    {
+        Serial.println("Config fetch failed");
+        return;
+    }
+
+    JsonDocument doc;
+    if (deserializeJson(doc, response))
+    {
+        Serial.println("Config JSON parse failed");
+        return;
+    }
+
+    uint32_t delayVal = doc["switch_delay"];
+    if (delayVal >= 500 && delayVal <= 30000)
+    {
+        switchDelayMs = delayVal;
+        Serial.print("Boot config: switch delay = ");
+        Serial.print(switchDelayMs);
+        Serial.println(" ms");
+    }
+
+    const char* phase = doc["phase"];
+    if (phase && strcmp(phase, "NONE") != 0)
+    {
+        Serial.print("Boot config: restoring phase ");
+        Serial.println(phase);
+        switchPhase(phase);
+    }
+}
+
+// ======================================================
+// SETUP
+// ======================================================
 
 void setup()
 {
-  Serial.begin(115200);
+    Serial.begin(115200);
 
-  deviceID = getDeviceID();
+    deviceID = getDeviceID();
 
-  Serial.println("==============================");
-  Serial.println("Chetrika Rayz Master");
-  Serial.println("Device ID: " + deviceID);
-  Serial.println("FW Version: " FW_VERSION);
-  Serial.println("API: " + String(API_SERVER));
-  Serial.println("==============================");
+    Serial.println();
+    Serial.println("================================");
+    Serial.println("CHETRIKA RAYZ DPS");
+    Serial.println("FW Version: " FW_VERSION);
+    Serial.println("Device ID: " + deviceID);
+    Serial.println("================================");
 
-  Wire.begin();
-  Wire.setClock(100000);
-  pinMode(21, INPUT_PULLUP);
-  pinMode(22, INPUT_PULLUP);
-  initLCD();
-  lcd.setCursor(0, 0);
-  lcd.print("Chetrika Rayz");
-  lcd.setCursor(0, 1);
-  lcd.print("Loading...");
+    pinMode(RELAY_R, OUTPUT);
+    pinMode(RELAY_Y, OUTPUT);
+    pinMode(RELAY_B, OUTPUT);
+    pinMode(FB_R, INPUT);
+    pinMode(FB_Y, INPUT);
+    pinMode(FB_B, INPUT);
+    pinMode(LED_PIN, OUTPUT);
 
-  SerialGSM.setRxBufferSize(16384);
-  SerialGSM.begin(921600, SERIAL_8N1, GSM_RX, GSM_TX);
+    allOff();
 
-  gsmReady = initGSM();
-  Serial.println(gsmReady ? "[MAIN] GSM Ready!" : "[MAIN] GSM Failed!");
+    PZEMSerial.begin(9600, SERIAL_8N1, PZEM_RX, PZEM_TX);
+    SerialGSM.setRxBufferSize(8192);
+    SerialGSM.begin(921600, SERIAL_8N1, GSM_RX, GSM_TX);
 
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print(gsmReady ? "GSM Ready" : "GSM Failed");
-  lcd.setCursor(0, 1);
-  lcd.print("ID:");
-  lcd.print(deviceID.substring(0, 8));
+    delay(CONTACTOR_SETTLE_MS);
+
+    delay(1000);
+
+    if (getFeedbackCount() > 0)
+        raiseFault("BOOT FEEDBACK ACTIVE");
+
+    if (!faultActive)
+    {
+        String lastPhase = loadPhase();
+        if (lastPhase != "NONE")
+        {
+            Serial.print("NVS: restoring last phase ");
+            Serial.println(lastPhase);
+            switchPhase(lastPhase);
+        }
+    }
+
+    gsmReady = initGSM();
+    Serial.println(gsmReady ? "[DPS] GSM Ready!" : "[DPS] GSM Failed!");
+
+    fetchDeviceConfig();
+
+    Serial.println();
+    Serial.println("SYSTEM READY");
+    Serial.println("Type H for help");
 }
+
+// ======================================================
+// LOOP
+// ======================================================
 
 void loop()
 {
-  unsigned long now = millis();
+    unsigned long now = millis();
 
-  if (now - lastI2CRead >= I2C_READ_INTERVAL_MS)
-  {
-    lastI2CRead = now;
+    handleSerial();
 
-    if (!getSlavePZEM(1, slavePZEM1))
-      Serial.println("PZEM1 Read Failed");
+    safetyCheck();
 
-    if (!getSlavePZEM(2, slavePZEM2))
-      Serial.println("PZEM2 Read Failed");
-
-    if (!getSlavePZEM(3, slavePZEM3))
-      Serial.println("PZEM3 Read Failed");
-
-    if (!getSlavePZEM(4, slavePZEM4))
-      Serial.println("PZEM4 (Neutral) Read Failed");
-  }
-
-  updateLCD();
-
-  if (now - lastSend >= SEND_INTERVAL_MS)
-  {
-    if (gsmReady)
+    if (faultActive != lastFaultState)
     {
-#define FMT(v,p) (isnan(v) ? "null" : String(v, p))
-
-      // Apply energy reset offsets
-      float rE1 = max(0.0f, slavePZEM1.energy - energyOffset1);
-      float rE2 = max(0.0f, slavePZEM2.energy - energyOffset2);
-      float rE3 = max(0.0f, slavePZEM3.energy - energyOffset3);
-
-      String payload = "{";
-      payload += "\"device_id\":\"" + deviceID + "\",";
-      payload += "\"fw_version\":\"" FW_VERSION "\",";
-      payload += "\"v1\":" + FMT(slavePZEM1.voltage, 2) + ",";
-      payload += "\"i1\":" + FMT(slavePZEM1.current, 3) + ",";
-      payload += "\"p1\":" + FMT(slavePZEM1.power, 2) + ",";
-      payload += "\"e1\":" + FMT(rE1, 2) + ",";
-      payload += "\"f1\":" + FMT(slavePZEM1.frequency, 2) + ",";
-      payload += "\"pf1\":" + FMT(slavePZEM1.pf, 3) + ",";
-      payload += "\"v2\":" + FMT(slavePZEM2.voltage, 2) + ",";
-      payload += "\"i2\":" + FMT(slavePZEM2.current, 3) + ",";
-      payload += "\"p2\":" + FMT(slavePZEM2.power, 2) + ",";
-      payload += "\"e2\":" + FMT(rE2, 2) + ",";
-      payload += "\"f2\":" + FMT(slavePZEM2.frequency, 2) + ",";
-      payload += "\"pf2\":" + FMT(slavePZEM2.pf, 3) + ",";
-      payload += "\"v3\":" + FMT(slavePZEM3.voltage, 2) + ",";
-      payload += "\"i3\":" + FMT(slavePZEM3.current, 3) + ",";
-      payload += "\"p3\":" + FMT(slavePZEM3.power, 2) + ",";
-      payload += "\"e3\":" + FMT(rE3, 2) + ",";
-      payload += "\"f3\":" + FMT(slavePZEM3.frequency, 2) + ",";
-      payload += "\"pf3\":" + FMT(slavePZEM3.pf, 3) + ",";
-      payload += "\"i_n\":" + FMT(slavePZEM4.current, 3);
-      payload += "}";
-
-#undef FMT
-
-      Serial.println("[MAIN] Sending real data...");
-      if (httpPost(API_DATA_PATH, payload, nullptr))
-        Serial.println("[MAIN] Data sent OK!");
-      else
-      {
-        Serial.println("[MAIN] Send failed -- reinit GSM");
-        gsmReady = false;
-        lastGSMRetry = now;
-      }
+        lastFaultState = faultActive;
+        sendTelemetry();
     }
-    else
+
+    // PZEM
+
+    if (now - lastPzemRead >= PZEM_INTERVAL_MS)
     {
-      if (now - lastGSMRetry >= GSM_RETRY_INTERVAL_MS)
-      {
+        lastPzemRead = now;
+        readPZEM();
+    }
+
+    // Telemetry
+
+    if (now - lastTelemetry >= TELEMETRY_INTERVAL_MS)
+    {
+        lastTelemetry = now;
+        safetyCheck();
+        sendTelemetry();
+    }
+
+    // Heartbeat
+
+    if (now - lastHeartbeat >= HEARTBEAT_INTERVAL_MS)
+    {
+        lastHeartbeat = now;
+        safetyCheck();
+        sendHeartbeat();
+    }
+
+    // Commands
+
+    if (now - lastCommandPoll >= COMMAND_INTERVAL_MS)
+    {
+        lastCommandPoll = now;
+        safetyCheck();
+        pollCommands();
+    }
+
+    // GSM retry (main_master pattern)
+
+    if (!gsmReady && now - lastGSMRetry >= GSM_RETRY_INTERVAL_MS)
+    {
         lastGSMRetry = now;
-        Serial.println("[MAIN] Retrying GSM init...");
+        Serial.println("[DPS] Retrying GSM init...");
         gsmReady = initGSM();
-      }
+        if (gsmReady) {
+            fetchDeviceConfig();
+        }
     }
 
-    lastSend = now;
-  }
+    // LED indicator
 
-  // Command polling
-  if (now - lastCommandPoll >= COMMAND_INTERVAL_MS)
-  {
-    lastCommandPoll = now;
-    pollCommands();
-  }
+    digitalWrite(LED_PIN, gsmReady ? HIGH : (now / 500) % 2);
 
-  // Heartbeat
-  if (now - lastHeartbeat >= HEARTBEAT_INTERVAL_MS)
-  {
-    lastHeartbeat = now;
-    sendHeartbeat();
-  }
+    delay(1);
 }
