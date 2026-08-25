@@ -40,7 +40,6 @@
 //   - Any feedback failure forces all relays OFF
 //
 // ALL HARDWARE PINS ARE DEFINED ONLY IN firmware.h.
-// All headers live in this sketch folder (no shared ../include).
 // ============================================================
 
 String deviceID;
@@ -60,10 +59,6 @@ float energy = 0;
 float frequency = 0;
 float pf = 0;
 bool meterValid = false;
-
-// Telemetry reports max(0, energy - energyOffset); the reset_energy
-// cloud command re-zeros the counter without touching the meter.
-float energyOffset = 0;
 
 bool gsmReady = false;
 unsigned long lastGSMRetry = 0;
@@ -86,11 +81,6 @@ const unsigned long HEARTBEAT_INTERVAL_MS = 60000UL;
 const unsigned long GSM_RETRY_INTERVAL_MS = 30000UL;
 
 String serialLine;
-
-// Forward declarations: these are referenced before they are defined,
-// and not every build system runs the IDE's auto-prototype pass.
-bool performOTA(const String &url, size_t expectedSize);
-void fetchDeviceConfig();
 
 // ============================================================
 // SETTINGS
@@ -127,30 +117,6 @@ void saveDelay()
   p.begin("swapper", false);
   p.putULong("delay", switchDelayMs);
   p.end();
-}
-
-void savePhase(char phase)
-{
-  Preferences p;
-  p.begin("swapper", false);
-  p.putString("lastPhase", String(phase));
-  p.end();
-}
-
-char loadPhase()
-{
-  Preferences p;
-  p.begin("swapper", true);
-  String phase = p.getString("lastPhase", "N");
-  p.end();
-
-  // A single-char value is this firmware's own; anything longer is a
-  // legacy entry such as "NONE" and simply means all-off.
-  if (phase.length() != 1)
-    return 'N';
-
-  char c = toupper(phase.charAt(0));
-  return (c == 'R' || c == 'Y' || c == 'B') ? c : 'N';
 }
 
 // ============================================================
@@ -194,8 +160,7 @@ void maintainSIM(unsigned long now)
   if (now - lastGSMRetry >= GSM_RETRY_INTERVAL_MS)
   {
     lastGSMRetry = now;
-    if (startSIM())
-      fetchDeviceConfig();
+    startSIM();
   }
 }
 
@@ -224,9 +189,6 @@ bool executePhaseCommand(const String &phaseText)
 
   bool ok = switchToPhase(requested);
   printRelayStatus();
-
-  if (ok)
-    savePhase(activePhase);
 
   return ok;
 }
@@ -313,7 +275,7 @@ void executeLocalCommand(const String &command)
       gsmAPN.c_str()
     );
 
-    if (!gsmReady && cloudArmed)
+    if (!gsmReady)
       startSIM();
 
     return;
@@ -489,52 +451,6 @@ void handleSerial()
 }
 
 // ============================================================
-// BOOT CONFIG FETCH
-// ============================================================
-// Server-side source of truth for the switching delay and the phase
-// the device should be on right after boot / GSM recovery.
-
-void fetchDeviceConfig()
-{
-  if (!gsmReady)
-    return;
-
-  String endpoint =
-    String("/api/device/phase?device_id=") + deviceID +
-    "&api_key=" DEVICE_API_KEY;
-
-  String response;
-  if (!httpGet(endpoint, &response))
-  {
-    Serial.println("[CONFIG] Fetch failed");
-    return;
-  }
-
-  JsonDocument doc;
-  if (deserializeJson(doc, response))
-  {
-    Serial.println("[CONFIG] JSON parse failed");
-    return;
-  }
-
-  uint32_t delayVal = doc["switch_delay"] | 0;
-  if (delayVal >= 500 && delayVal <= 30000)
-  {
-    switchDelayMs = delayVal;
-    Serial.printf("[CONFIG] Switch delay: %u ms\n", (unsigned)switchDelayMs);
-  }
-
-  const char *phase = doc["phase"];
-  if (phase && strlen(phase) == 1 &&
-      (phase[0] == 'R' || phase[0] == 'Y' || phase[0] == 'B'))
-  {
-    Serial.print("[CONFIG] Restoring phase ");
-    Serial.println(phase);
-    executePhaseCommand(phase);
-  }
-}
-
-// ============================================================
 // CLOUD COMMAND RESULT
 // ============================================================
 
@@ -655,76 +571,6 @@ void processCloudCommand(
     return;
   }
 
-  if (cmdType == "reset_energy")
-  {
-    energyOffset = energy;
-
-    sendCommandResult(
-      commandId,
-      true,
-      "Energy counter reset"
-    );
-
-    return;
-  }
-
-  if (cmdType == "ota")
-  {
-    String fwUrl = params["firmware_url"] | "";
-    String version = params["version"] | "";
-    size_t fwSize = (size_t)((unsigned long)(params["size"] | 0UL));
-
-    if (fwUrl.length() == 0 || version.length() == 0 || fwSize == 0)
-    {
-      sendCommandResult(
-        commandId,
-        false,
-        "OTA params incomplete - push a firmware version first"
-      );
-
-      return;
-    }
-
-    // Do not start flashing while a relay fault is active — a mid-swap or
-    // interlock-violation condition is not the moment to also be reflashing
-    // the MCU driving that hardware.
-    if (!safetyCheck())
-    {
-      sendCommandResult(
-        commandId,
-        false,
-        "Relay safety check failed before OTA"
-      );
-
-      reportFirmwareStatus("failed", "relay safety check failed before OTA");
-
-      return;
-    }
-
-    Serial.printf(
-      "[CMD] OTA: %s v%s (%u bytes)\n",
-      fwUrl.c_str(),
-      version.c_str(),
-      (unsigned)fwSize
-    );
-
-    // Ack now — flash + reboot below ends this session anyway.
-    sendCommandResult(commandId, true, "OTA update starting");
-
-    bool ok = performOTA(fwUrl, fwSize);
-
-    reportFirmwareStatus(ok ? "success" : "failed", version);
-
-    if (ok)
-    {
-      Serial.println("[OTA] Restarting into new firmware...");
-      delay(500);
-      ESP.restart();
-    }
-
-    return;
-  }
-
   sendCommandResult(
     commandId,
     false,
@@ -807,7 +653,7 @@ String buildDataPayload()
   doc["voltage"] = voltage;
   doc["current"] = current;
   doc["power"] = power;
-  doc["energy"] = max(0.0f, energy - energyOffset);
+  doc["energy"] = energy;
   doc["frequency"] = frequency;
   doc["pf"] = pf;
   doc["meter_valid"] = meterValid;
@@ -1149,16 +995,8 @@ void setup()
     (unsigned long)GSM_BAUD
   );
 
-  Serial.printf(
-    "LED       : GPIO %d\n",
-    LED_PIN
-  );
-
   Serial.println("Network   : SIMCOM / A7677S ONLY");
   Serial.println("==============================================");
-
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
 
   // Hardware initialization.
   initRelays();
@@ -1168,28 +1006,12 @@ void setup()
   readMeter(pzemN, voltage, current, power, energy, frequency, pf);
   lastPZEMRead = millis();
 
-  // Restore whatever phase was commanded before the last reboot. The
-  // switch itself verifies physical feedback; a stuck contactor fails
-  // safely and leaves everything OFF instead of restoring.
-  char restoredPhase = loadPhase();
-  if (restoredPhase != 'N')
-  {
-    Serial.print("[NVS] Restoring last phase ");
-    Serial.println(restoredPhase);
-    switchToPhase(restoredPhase);
-  }
-
   checkProvisioning();
 
   // SIM ONLY — only bring up the modem/cloud link if this device has a
   // real per-device API key (see checkProvisioning()).
   if (cloudArmed)
-  {
     startSIM();
-
-    if (gsmReady)
-      fetchDeviceConfig();
-  }
 
   Serial.println();
   Serial.println("SIM ONLY MODE READY.");
@@ -1253,9 +1075,6 @@ void loop()
       checkAndPerformOTA();
     }
   }
-
-  // LED indicator: solid when cloud link is up, blinking otherwise.
-  digitalWrite(LED_PIN, gsmReady ? HIGH : ((now / 500) % 2));
 
   delay(10);
 }
