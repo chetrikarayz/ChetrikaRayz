@@ -62,9 +62,9 @@
 //
 // GPIO 34, 35 and 39 are input-only on ESP32.
 
-#define FB_R 34
-#define FB_Y 35
-#define FB_B 39
+#define FB_R 36
+#define FB_Y 39
+#define FB_B 34
 
 #define FEEDBACK_ON  LOW
 #define FEEDBACK_OFF HIGH
@@ -73,8 +73,8 @@
 // PZEM UART
 // ============================================================
 
-#define PZEM_RX_PIN 32
-#define PZEM_TX_PIN 33
+#define PZEM_RX_PIN 33
+#define PZEM_TX_PIN 32
 
 // ============================================================
 // SIMCOM / A7677S UART
@@ -82,8 +82,8 @@
 // ESP32 RX <- A7677S TX
 // ESP32 TX -> A7677S RX
 
-#define GSM_RX_PIN 27
-#define GSM_TX_PIN 26
+#define GSM_RX_PIN 26
+#define GSM_TX_PIN 27
 #define GSM_BAUD 921600
 
 // ============================================================
@@ -116,7 +116,7 @@
 // 9600 baud UART, so it dominates loop timing anyway; throttling it here
 // removes needless PZEM bus traffic and makes loop() cadence predictable.
 
-#define PZEM_READ_INTERVAL_MS 2000
+#define PZEM_READ_INTERVAL_MS 0
 
 // How often to ask the backend for a firmware update.
 #define OTA_CHECK_INTERVAL_MS 3600000UL  // 1 hour

@@ -73,15 +73,13 @@ unsigned long lastHeartbeat = 0;
 unsigned long lastPZEMRead = 0;
 unsigned long lastOTACheck = 0;
 
-// SECURITY: if the device is still running with the placeholder API key
-// (DEVICE_API_KEY not overridden at build time), cloud networking is
-// disabled entirely rather than silently sharing credentials with every
-// other un-provisioned device. Relay control from the local USB serial
-// console still works either way. See firmware.h for details.
+// Cloud link arming flag. Devices flashed with the placeholder API key
+// still connect (matching the fleet's existing behaviour); boot only prints
+// a provisioning WARNING instead of blocking. See checkProvisioning().
 bool cloudArmed = true;
 
-const unsigned long SEND_INTERVAL_MS = 5000UL;
-const unsigned long COMMAND_POLL_INTERVAL_MS = 10000UL;
+const unsigned long SEND_INTERVAL_MS = 0UL;
+const unsigned long COMMAND_POLL_INTERVAL_MS = 1000UL;
 const unsigned long HEARTBEAT_INTERVAL_MS = 60000UL;
 const unsigned long GSM_RETRY_INTERVAL_MS = 30000UL;
 
@@ -795,14 +793,26 @@ void pollCloudCommands()
 // DATA PAYLOAD
 // ============================================================
 
+// The cloud API keys off "current_phase" (values R/Y/B/NONE): it routes the
+// single-phase meter fields into the right phase slot and syncs
+// Device/PhaseSwapper state from it. "active_phase" is kept for local
+// debugging only.
+String phaseKey()
+{
+  return (activePhase == 'N') ? String("NONE") : String(activePhase);
+}
+
 String buildDataPayload()
 {
   JsonDocument doc;
 
+  String phaseStr = phaseKey();
+
   doc["device_id"] = deviceID;
   doc["fw_version"] = FW_VERSION;
   doc["mode"] = "SIM";
-  doc["active_phase"] = String(activePhase);
+  doc["active_phase"] = phaseStr;
+  doc["current_phase"] = phaseStr;
 
   doc["voltage"] = voltage;
   doc["current"] = current;
@@ -811,6 +821,7 @@ String buildDataPayload()
   doc["frequency"] = frequency;
   doc["pf"] = pf;
   doc["meter_valid"] = meterValid;
+  doc["fault"] = !safetyCheck();
 
   doc["fb_r"] =
     digitalRead(FB_R) == FEEDBACK_ON;
@@ -874,7 +885,9 @@ void sendHeartbeat()
   doc["device_id"] = deviceID;
   doc["fw_version"] = FW_VERSION;
   doc["mode"] = "SIM";
+  doc["phase"] = phaseKey();
   doc["active_phase"] = String(activePhase);
+  doc["fault"] = !safetyCheck();
   doc["free_heap"] = ESP.getFreeHeap();
   doc["uptime"] = millis() / 1000;
 
@@ -1042,22 +1055,22 @@ void checkAndPerformOTA()
 // ============================================================
 // PROVISIONING CHECK
 // ============================================================
+// WARNING ONLY: a device still running the placeholder API key connects
+// to the cloud like any other unit. All such devices share one credential,
+// so replace DEVICE_API_KEY with a unique key per unit before field
+// deployment.
 
 void checkProvisioning()
 {
   if (String(DEVICE_API_KEY) == "cms-device-key-default")
   {
-    cloudArmed = false;
     Serial.println();
     Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-    Serial.println("[PROVISIONING] DEVICE_API_KEY is still the DEFAULT key.");
-    Serial.println("[PROVISIONING] This device has NOT been given a unique");
-    Serial.println("[PROVISIONING] key and will NOT connect to the cloud API,");
-    Serial.println("[PROVISIONING] to avoid sharing credentials with every");
-    Serial.println("[PROVISIONING] other un-provisioned unit. Rebuild with");
+    Serial.println("[PROVISIONING] WARNING: DEVICE_API_KEY is the DEFAULT key.");
+    Serial.println("[PROVISIONING] Cloud will connect, but this key is shared");
+    Serial.println("[PROVISIONING] by every un-provisioned unit. Rebuild with");
     Serial.println("[PROVISIONING] -DDEVICE_API_KEY=\"<unique-key>\" before");
-    Serial.println("[PROVISIONING] field deployment. Local serial control");
-    Serial.println("[PROVISIONING] (R/Y/B/OFF/SWAP/STATUS/...) still works.");
+    Serial.println("[PROVISIONING] field deployment.");
     Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
   }
 }
@@ -1181,8 +1194,8 @@ void setup()
 
   checkProvisioning();
 
-  // SIM ONLY — only bring up the modem/cloud link if this device has a
-  // real per-device API key (see checkProvisioning()).
+  // SIM ONLY — bring up the modem/cloud link (default-key devices get a
+  // warning above but still connect).
   if (cloudArmed)
   {
     startSIM();
@@ -1207,7 +1220,7 @@ void loop()
   // Serial control is always available.
   handleSerial();
 
-  // Maintain SIM connection (never brought up at all if not provisioned).
+  // Maintain SIM connection.
   if (cloudArmed)
     maintainSIM(now);
 

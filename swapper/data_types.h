@@ -2,7 +2,7 @@
 
 #include <math.h>
 
-#define CT_RATIO 40.0f
+#define CT_RATIO 1.0f
 
 struct PZEMData
 {
