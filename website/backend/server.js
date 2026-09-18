@@ -74,6 +74,7 @@ const FirmwareSchema = new mongoose.Schema({
   filename: { type: String, required: true },
   size: { type: Number, required: true },
   sha256: { type: String, required: true },
+  md5: { type: String, default: '' },
   binary: { type: Buffer, required: true }, // Stored in MongoDB
   changelog: { type: String, default: '' },
   isLatest: { type: Boolean, default: false },
@@ -581,6 +582,7 @@ app.post("/api/data", authenticateDevice, async (req, res) => {
           received: true,
           firmware_url: downloadUrl,
           version: fw.version,
+          md5: fw.md5 || '',
           sha256: fw.sha256,
           size: fw.size
         });
@@ -1072,7 +1074,9 @@ app.get("/api/commands/:deviceId", authenticateDevice, async (req, res) => {
           { expiresIn: '1h' }
         );
         response.command.params.firmware_url = `https://${req.get('host')}/api/iot/firmware/download/${fw.version}?token=${downloadToken}`;
+        response.command.params.version = fw.version;
         response.command.params.size = fw.size;
+        response.command.params.md5 = fw.md5 || '';
         response.command.params.sha256 = fw.sha256;
       }
     }
@@ -1432,6 +1436,7 @@ app.post("/api/iot/firmware/check", async (req, res) => {
         firmware_url: downloadUrl,
         version: fw.version,
         size: fw.size,
+        md5: fw.md5 || '',
         sha256: fw.sha256
       });
     }
@@ -1515,8 +1520,9 @@ app.post("/api/iot/firmware/upload", authenticateToken, authorizeRole('admin', '
       return res.status(400).json({ error: "Firmware binary exceeds 4MB limit" });
     }
 
-    // Compute SHA256
+    // Compute SHA256 and MD5
     const sha256 = crypto.createHash('sha256').update(binary).digest('hex');
+    const md5 = crypto.createHash('md5').update(binary).digest('hex');
 
     // Unmark previous latest in this channel
     await Firmware.updateMany(
@@ -1530,6 +1536,7 @@ app.post("/api/iot/firmware/upload", authenticateToken, authorizeRole('admin', '
       filename: `firmware_${version}.bin`,
       size: binary.length,
       sha256,
+      md5,
       binary,
       changelog: changelog || '',
       isLatest: true,
@@ -1542,11 +1549,11 @@ app.post("/api/iot/firmware/upload", authenticateToken, authorizeRole('admin', '
       message: `Firmware v${version} uploaded successfully`,
       version: fw.version,
       size: fw.size,
-      sha256: fw.sha256
+      sha256: fw.sha256,
+      md5: fw.md5
     });
-  } catch (err) {
+} catch (err) {
     logger.error("Firmware upload error:", err.message);
-    res.status(500).json({ error: "Failed to upload firmware" });
   }
 });
 
@@ -1556,7 +1563,7 @@ app.get("/api/iot/firmware/versions", authenticateToken, async (req, res) => {
     const channel = req.query.channel || null;
     const filter = channel ? { channel } : {};
     const firmwares = await Firmware.find(filter, {
-      version: 1, channel: 1, filename: 1, size: 1, sha256: 1,
+      version: 1, channel: 1, filename: 1, size: 1, sha256: 1, md5: 1,
       isLatest: 1, changelog: 1, minDeviceVersion: 1, createdAt: 1, createdBy: 1
     }).sort({ createdAt: -1 }).lean();
 

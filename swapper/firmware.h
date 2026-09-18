@@ -9,7 +9,7 @@
 // ============================================================
 
 #ifndef FW_VERSION
-#define FW_VERSION "1.2.0-SIM"
+#define FW_VERSION "1.2.0"
 #endif
 
 #define FW_CHANNEL "stable"

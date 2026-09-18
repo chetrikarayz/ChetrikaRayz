@@ -617,7 +617,23 @@ inline bool gsmDownloadStream(const String &url, StreamCallback cb)
 
 // ==================== OTA Check ====================
 
-inline bool checkOTAUpdate(String &outUrl, String &outVersion, size_t &outSize)
+// Extracts a quoted string value for "key" from a flat JSON response, e.g.
+// extractJsonString(resp, "version") on {"version":"1.2.3"} -> "1.2.3".
+// Returns "" if the key isn't present. Not a general JSON parser — same
+// assumption the rest of this file already makes about the backend's
+// flat, single-level response shape.
+inline String extractJsonString(const String &response, const String &key)
+{
+  String needle = "\"" + key + "\":\"";
+  int start = response.indexOf(needle);
+  if (start < 0) return "";
+  start += needle.length();
+  int end = response.indexOf("\"", start);
+  if (end < 0) return "";
+  return response.substring(start, end);
+}
+
+inline bool checkOTAUpdate(String &outUrl, String &outVersion, size_t &outSize, String &outMd5)
 {
   if (!gsmReady) return false;
 
@@ -634,15 +650,16 @@ inline bool checkOTAUpdate(String &outUrl, String &outVersion, size_t &outSize)
   if (response.indexOf("\"update_available\":true") < 0)
     return false;
 
-  int urlStart = response.indexOf("\"firmware_url\":\"") + 16;
-  int urlEnd = response.indexOf("\"", urlStart);
-  if (urlStart < 16 || urlEnd < 0) return false;
-  outUrl = response.substring(urlStart, urlEnd);
+  outUrl = extractJsonString(response, "firmware_url");
+  if (outUrl.length() == 0) return false;
 
-  int verStart = response.indexOf("\"version\":\"") + 11;
-  int verEnd = response.indexOf("\"", verStart);
-  if (verStart < 11 || verEnd < 0) return false;
-  outVersion = response.substring(verStart, verEnd);
+  outVersion = extractJsonString(response, "version");
+  if (outVersion.length() == 0) return false;
+
+  // Optional: not every backend deployment will have this populated yet.
+  // Empty just means performOTA() proceeds without integrity verification
+  // (it logs and reports that loudly rather than silently skipping it).
+  outMd5 = extractJsonString(response, "md5");
 
   Serial.printf("[OTA] check response: \"%s\"\n", response.c_str());
 

@@ -87,7 +87,18 @@ String serialLine;
 
 // Forward declarations: these are referenced before they are defined,
 // and not every build system runs the IDE's auto-prototype pass.
-bool performOTA(const String &url, size_t expectedSize);
+bool performOTA(const String &url, size_t expectedSize, const String &expectedMd5);
+
+// True if s is exactly 32 lowercase/uppercase hex characters (an MD5 hex
+// digest). Used to sanity-check a backend-supplied hash before handing it
+// to Update.setMD5(), which itself just returns false on anything invalid.
+bool isValidMd5Hex(const String &s)
+{
+  if (s.length() != 32) return false;
+  for (size_t i = 0; i < s.length(); i++)
+    if (!isHexadecimalDigit(s.charAt(i))) return false;
+  return true;
+}
 void fetchDeviceConfig();
 
 // ============================================================
@@ -671,6 +682,7 @@ void processCloudCommand(
     String fwUrl = params["firmware_url"] | "";
     String version = params["version"] | "";
     size_t fwSize = (size_t)((unsigned long)(params["size"] | 0UL));
+    String fwMd5 = params["md5"] | "";
 
     if (fwUrl.length() == 0 || version.length() == 0 || fwSize == 0)
     {
@@ -709,7 +721,7 @@ void processCloudCommand(
     // Ack now — flash + reboot below ends this session anyway.
     sendCommandResult(commandId, true, "OTA update starting");
 
-    bool ok = performOTA(fwUrl, fwSize);
+    bool ok = performOTA(fwUrl, fwSize, fwMd5);
 
     reportFirmwareStatus(ok ? "success" : "failed", version);
 
@@ -936,7 +948,7 @@ void sendHeartbeat()
 // actually receive a firmware update over the air. This wires them up to
 // the ESP32 OTA flash partition via the core Update library.
 
-bool performOTA(const String &url, size_t expectedSize)
+bool performOTA(const String &url, size_t expectedSize, const String &expectedMd5)
 {
   if (expectedSize == 0)
   {
@@ -944,9 +956,33 @@ bool performOTA(const String &url, size_t expectedSize)
     return false;
   }
 
+  if (expectedMd5.length() > 0)
+  {
+    if (!isValidMd5Hex(expectedMd5))
+    {
+      Serial.printf("[OTA] Refusing update: malformed md5 from backend: \"%s\"\n", expectedMd5.c_str());
+      return false;
+    }
+    Serial.printf("[OTA] Expecting MD5: %s\n", expectedMd5.c_str());
+  }
+  else
+  {
+    // Not a hard failure — some backend deployments may not populate this
+    // yet — but flashing an unverified image onto a device driving live
+    // phase relays is worth a loud warning, not a silent pass.
+    Serial.println("[OTA] WARNING: no MD5 supplied by backend, flashing WITHOUT integrity verification");
+  }
+
   if (!Update.begin(expectedSize))
   {
     Serial.printf("[OTA] Update.begin failed: %s\n", Update.errorString());
+    return false;
+  }
+
+  if (expectedMd5.length() > 0 && !Update.setMD5(expectedMd5.c_str()))
+  {
+    Serial.println("[OTA] Update.setMD5 rejected the supplied hash, aborting");
+    Update.abort();
     return false;
   }
 
@@ -1002,10 +1038,10 @@ void checkAndPerformOTA()
   if (!gsmReady)
     return;
 
-  String url, version;
+  String url, version, md5;
   size_t size = 0;
 
-  if (!checkOTAUpdate(url, version, size))
+  if (!checkOTAUpdate(url, version, size, md5))
     return; // no update available, or the check itself failed
 
   if (version.length() == 0 || version == FW_VERSION)
@@ -1040,7 +1076,7 @@ void checkAndPerformOTA()
     return;
   }
 
-  bool ok = performOTA(url, size);
+  bool ok = performOTA(url, size, md5);
 
   reportFirmwareStatus(ok ? "success" : "failed", version);
 
